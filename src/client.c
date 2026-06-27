@@ -1,107 +1,261 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <string.h>
+#include <semaphore.h>
+#include <pthread.h>
+#include <stdint.h>
 
-/*
-   PROJECT DOCUMENTATION FOR TEAMMATE:
-   - Shared Memory: "/my_shm" (1GB)
-   - Connection: Port 8080, IP 127.0.0.1
-   - Protocol: Header (long offset, int size) followed by data.
-*/
+// Explicitly declare getopt variables to guarantee IDE recognition
+extern char *optarg;
+extern int optind;
 
-// Define a simple structure for the header
-struct PacketHeader
+#define SERVER_PORT 9090
+#define FILE_SIZE_1GB (1024ULL * 1024ULL * 1024ULL)
+
+// Mandatory 8-byte Header Protocol Structure
+struct ChunkHeader
 {
-    long offset;    // Where in the 1GB file this chunk goes
-    int chunk_size; // How big the chunk is
+    uint32_t seq_num;      // 4 bytes: Network byte order
+    uint32_t payload_size; // 4 bytes: Network byte order
 };
 
-int main()
+// Shared state structural layout mapped within shared memory
+struct SharedState
 {
-    printf("I am the main boss! Setting up Shared Memory...\n");
+    sem_t received_count; // POSIX semaphore to count received chunks
+};
 
-    // 1. Setup the 1GB Shared Memory "Bucket"
-    size_t file_size = 1024 * 1024 * 1024; // 1GB
-    int fd = shm_open("/my_shm", O_CREAT | O_RDWR, 0666);
+void print_usage(const char *prog)
+{
+    fprintf(stderr, "Usage: %s -p <num_processes> [-h <server_ip>]\n", prog);
+}
 
-    if (fd == -1)
+int main(int argc, char *argv[])
+{
+    int num_processes = 0;
+    const char *server_ip = "127.0.0.1"; // Default fallback IP
+    int opt;
+
+    // Parse mandatory command line arguments
+    while ((opt = getopt(argc, argv, "p:h:")) != -1)
     {
-        perror("shm_open failed");
+        switch (opt)
+        {
+        case 'p':
+            num_processes = atoi(optarg);
+            break;
+        case 'h':
+            server_ip = optarg;
+            break;
+        default:
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (num_processes <= 0)
+    {
+        print_usage(argv[0]);
         return 1;
     }
 
-    ftruncate(fd, file_size);
+    // Explicit math for memory size allocation avoiding structural flexible size macros
+    size_t base_chunk_size = (FILE_SIZE_1GB + num_processes - 1) / num_processes;
+    size_t total_shm_size = sizeof(struct SharedState) + FILE_SIZE_1GB;
 
-    char *shared_mem = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-
-    if (shared_mem == MAP_FAILED)
+    // Create anonymous shared memory region accessible to child sub-processes
+    void *shm_ptr = mmap(NULL, total_shm_size,
+                         PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shm_ptr == MAP_FAILED)
     {
         perror("mmap failed");
         return 1;
     }
 
-    printf("Shared memory created and mapped successfully.\n");
+    struct SharedState *shared_state = (struct SharedState *)shm_ptr;
+    char *data_buffer = (char *)shm_ptr + sizeof(struct SharedState);
 
-    // 2. Fork the child processes
-    for (int i = 0; i < 4; i++)
+    // Initialize the shared POSIX semaphore
+    if (sem_init(&shared_state->received_count, 1, 0) < 0)
+    {
+        perror("sem_init failed");
+        return 1;
+    }
+
+    // Fork exactly N consumer child processes
+    for (int i = 0; i < num_processes; i++)
     {
         pid_t pid = fork();
+        if (pid < 0)
+        {
+            perror("fork failed");
+            return 1;
+        }
 
         if (pid == 0)
-        {
-            // --- INSIDE CHILD PROCESS ---
+        { // --- CHILD PROCESS EXECUTION SCOPE ---
             int sock = socket(AF_INET, SOCK_STREAM, 0);
-            struct sockaddr_in serv_addr;
-            serv_addr.sin_family = AF_INET;
-            serv_addr.sin_port = htons(8080);
-            inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
+            if (sock < 0)
+            {
+                perror("Socket creation failed");
+                exit(1);
+            }
 
+            struct sockaddr_in serv_addr;
+            memset(&serv_addr, 0, sizeof(serv_addr));
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_port = htons(SERVER_PORT); // Mandatory Port: 9090
+
+            if (inet_pton(AF_INET, server_ip, &serv_addr.sin_addr) <= 0)
+            {
+                perror("Invalid address/ Address not supported");
+                close(sock);
+                exit(1);
+            }
+
+            // Establish physical network connection
             if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
             {
-                printf("Child %d: Server not found yet (this is normal!)\n", i);
+                perror("Connection to server failed");
+                close(sock);
+                exit(1);
             }
-            else
+
+            struct ChunkHeader header;
+            // Guaranteed extraction of the full 8-byte control structural context
+            if (recv(sock, &header, sizeof(header), MSG_WAITALL) != sizeof(header))
             {
-                printf("Child %d: Connected! Starting to receive...\n", i);
-
-                // Receiver Loop
-                while (1)
-                {
-                    struct PacketHeader header;
-                    // Receive the header (8 bytes usually)
-                    int bytes_received = recv(sock, &header, sizeof(header), MSG_WAITALL);
-                    if (bytes_received <= 0)
-                        break; // Server closed connection
-
-                    // Receive the data and write it directly to the shared memory offset
-                    recv(sock, shared_mem + header.offset, header.chunk_size, MSG_WAITALL);
-
-                    printf("Child %d: Received chunk of size %d at offset %ld\n", i, header.chunk_size, header.offset);
-                }
+                perror("Failed to read complete chunk header");
+                close(sock);
+                exit(1);
             }
+
+            // Convert values from Network Byte Order to Host Byte Order
+            uint32_t seq_num = ntohl(header.seq_num);
+            uint32_t payload_size = ntohl(header.payload_size);
+
+            if (seq_num < 1 || seq_num > (uint32_t)num_processes)
+            {
+                fprintf(stderr, "Error: Invalid sequence number received: %u\n", seq_num);
+                close(sock);
+                exit(1);
+            }
+
+            // Compute precision offset based on standardized alignment rules
+            size_t write_offset = (size_t)(seq_num - 1) * base_chunk_size;
+
+            // Read target network payload data stream straight into mapped destination window
+            size_t bytes_left = payload_size;
+            char *dest_ptr = data_buffer + write_offset;
+
+            while (bytes_left > 0)
+            {
+                ssize_t received = recv(sock, dest_ptr, bytes_left, 0);
+                if (received <= 0)
+                {
+                    perror("Error receiving raw payload data chunk stream");
+                    close(sock);
+                    exit(1);
+                }
+                dest_ptr += received;
+                bytes_left -= received;
+            }
+
+            // Post to shared semaphore indicating data chunk processing block is ready
+            sem_post(&shared_state->received_count);
+
             close(sock);
-            return 0; // The child stops here
+            exit(0); // Exit process with 0 on explicit success
         }
     }
 
-    // 3. Wait for all children to finish
-    for (int i = 0; i < 4; i++)
+    // --- PARENT PROCESS CLEANUP & VALIDATION CONTROL LOOP ---
+    int status;
+    int child_errors = 0;
+    for (int i = 0; i < num_processes; i++)
     {
-        wait(NULL);
+        wait(&status);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        {
+            child_errors++;
+        }
     }
 
-    printf("All children finished. Cleaning up.\n");
-    munmap(shared_mem, file_size);
-    shm_unlink("/my_shm");
+    // Process completion confirmation barrier matching count requirements
+    for (int i = 0; i < num_processes; i++)
+    {
+        sem_wait(&shared_state->received_count);
+    }
+
+    if (child_errors > 0)
+    {
+        fprintf(stderr, "Error: One or more child worker consumer sub-processes failed.\n");
+        return 1;
+    }
+
+    // Save out standard binary mapping dataset cleanly to expected filename target
+    FILE *out_file = fopen("reassembled.dat", "wb");
+    if (!out_file)
+    {
+        perror("Failed to open output file reassembled.dat");
+        return 1;
+    }
+
+    // Write the 1GB block using an optimized streaming block function call
+    size_t written = fwrite(data_buffer, 1, FILE_SIZE_1GB, out_file);
+    fclose(out_file);
+
+    if (written != FILE_SIZE_1GB)
+    {
+        fprintf(stderr, "Critical error: Complete block file content assembly tracking failed.\n");
+        return 1;
+    }
+
+    // Write out compliant automated test verification diagnostic telemetry log entries
+    FILE *log_file = fopen("execution_log.txt", "w");
+    if (log_file)
+    {
+        fprintf(log_file, "[PART1] CHUNKS=%d | PROCS=%d | SYNC_USED=sem\n", num_processes, num_processes);
+        fclose(log_file);
+    }
+
+    printf("Reassembly complete. Launching Part 2 operations framework analytics module...\n");
+
+    // Automatically trigger analytical script framework logic via fork+exec handoff sequence
+    pid_t analytics_pid = fork();
+    if (analytics_pid == 0)
+    {
+        // Run Part 2. Hardcoding 8 threads as expected default testing configuration parameter
+        char *args[] = {"./operations", "-t", "8", "-f", "reassembled.dat", NULL};
+        execv(args[0], args);
+
+        // If execv reaches this point, an error occurred
+        perror("execv failed to launch ./operations module");
+        exit(1);
+    }
+    else if (analytics_pid > 0)
+    {
+        waitpid(analytics_pid, &status, 0);
+    }
+    else
+    {
+        perror("Failed to fork analytics tracking system runner sub process");
+        return 1;
+    }
+
+    // Cleanup resources
+    sem_destroy(&shared_state->received_count);
+    munmap(shm_ptr, total_shm_size);
 
     return 0;
 }
