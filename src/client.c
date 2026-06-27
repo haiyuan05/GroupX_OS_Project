@@ -14,14 +14,13 @@
 #include <pthread.h>
 #include <stdint.h>
 
-// Explicitly declare getopt variables to guarantee IDE recognition
 extern char *optarg;
 extern int optind;
 
 #define SERVER_PORT 9090
 #define FILE_SIZE_1GB (1024ULL * 1024ULL * 1024ULL)
 
-// Mandatory 8-byte Header Protocol Structure
+// Mandatory 8-byte Header Protocol Structure (Section 3.2)
 struct ChunkHeader
 {
     uint32_t seq_num;      // 4 bytes: Network byte order
@@ -68,7 +67,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Explicit math for memory size allocation avoiding structural flexible size macros
+    // Explicit math for memory size allocation matching specifications
     size_t base_chunk_size = (FILE_SIZE_1GB + num_processes - 1) / num_processes;
     size_t total_shm_size = sizeof(struct SharedState) + FILE_SIZE_1GB;
 
@@ -85,10 +84,11 @@ int main(int argc, char *argv[])
     struct SharedState *shared_state = (struct SharedState *)shm_ptr;
     char *data_buffer = (char *)shm_ptr + sizeof(struct SharedState);
 
-    // Initialize the shared POSIX semaphore
+    // Initialize the shared POSIX semaphore for inter-process coordination
     if (sem_init(&shared_state->received_count, 1, 0) < 0)
     {
         perror("sem_init failed");
+        munmap(shm_ptr, total_shm_size);
         return 1;
     }
 
@@ -99,6 +99,8 @@ int main(int argc, char *argv[])
         if (pid < 0)
         {
             perror("fork failed");
+            sem_destroy(&shared_state->received_count);
+            munmap(shm_ptr, total_shm_size);
             return 1;
         }
 
@@ -153,11 +155,10 @@ int main(int argc, char *argv[])
 
             // Compute precision offset based on standardized alignment rules
             size_t write_offset = (size_t)(seq_num - 1) * base_chunk_size;
-
-            // Read target network payload data stream straight into mapped destination window
             size_t bytes_left = payload_size;
             char *dest_ptr = data_buffer + write_offset;
 
+            // Stream network payload data straight into mapped destination window
             while (bytes_left > 0)
             {
                 ssize_t received = recv(sock, dest_ptr, bytes_left, 0);
@@ -171,17 +172,18 @@ int main(int argc, char *argv[])
                 bytes_left -= received;
             }
 
-            // Post to shared semaphore indicating data chunk processing block is ready
+            // Post to shared semaphore indicating data chunk block is completely written
             sem_post(&shared_state->received_count);
-
             close(sock);
-            exit(0); // Exit process with 0 on explicit success
+            exit(0);
         }
     }
 
     // --- PARENT PROCESS CLEANUP & VALIDATION CONTROL LOOP ---
     int status;
     int child_errors = 0;
+
+    // Step 1: Wait for all N children to physically terminate
     for (int i = 0; i < num_processes; i++)
     {
         wait(&status);
@@ -191,16 +193,19 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Process completion confirmation barrier matching count requirements
+    // FIX: Catch errors immediately to prevent deadlock on sem_wait loops
+    if (child_errors > 0)
+    {
+        fprintf(stderr, "Error: %d child worker sub-processes failed execution.\n", child_errors);
+        sem_destroy(&shared_state->received_count);
+        munmap(shm_ptr, total_shm_size);
+        return 1;
+    }
+
+    // Step 2: Safe confirmation barrier check matching count tracking requirements
     for (int i = 0; i < num_processes; i++)
     {
         sem_wait(&shared_state->received_count);
-    }
-
-    if (child_errors > 0)
-    {
-        fprintf(stderr, "Error: One or more child worker consumer sub-processes failed.\n");
-        return 1;
     }
 
     // Save out standard binary mapping dataset cleanly to expected filename target
@@ -208,6 +213,8 @@ int main(int argc, char *argv[])
     if (!out_file)
     {
         perror("Failed to open output file reassembled.dat");
+        sem_destroy(&shared_state->received_count);
+        munmap(shm_ptr, total_shm_size);
         return 1;
     }
 
@@ -218,6 +225,8 @@ int main(int argc, char *argv[])
     if (written != FILE_SIZE_1GB)
     {
         fprintf(stderr, "Critical error: Complete block file content assembly tracking failed.\n");
+        sem_destroy(&shared_state->received_count);
+        munmap(shm_ptr, total_shm_size);
         return 1;
     }
 
@@ -231,15 +240,15 @@ int main(int argc, char *argv[])
 
     printf("Reassembly complete. Launching Part 2 operations framework analytics module...\n");
 
-    // Automatically trigger analytical script framework logic via fork+exec handoff sequence
+    // Automatically trigger analytical framework logic via fork+exec handoff sequence
     pid_t analytics_pid = fork();
     if (analytics_pid == 0)
     {
-        // Run Part 2. Hardcoding 8 threads as expected default testing configuration parameter
+        // Run Part 2. Hardcoding 8 threads as expected default testing parameter
         char *args[] = {"./operations", "-t", "8", "-f", "reassembled.dat", NULL};
         execv(args[0], args);
 
-        // If execv reaches this point, an error occurred
+        // If execv reaches this point, an execution error occurred
         perror("execv failed to launch ./operations module");
         exit(1);
     }
@@ -250,10 +259,12 @@ int main(int argc, char *argv[])
     else
     {
         perror("Failed to fork analytics tracking system runner sub process");
+        sem_destroy(&shared_state->received_count);
+        munmap(shm_ptr, total_shm_size);
         return 1;
     }
 
-    // Cleanup resources
+    // Clean up shared environment resources before clean termination
     sem_destroy(&shared_state->received_count);
     munmap(shm_ptr, total_shm_size);
 
